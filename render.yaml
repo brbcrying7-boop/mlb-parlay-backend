@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: mlb-parlay-backend
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: PORT
+        value: 3001
