@@ -212,6 +212,19 @@ app.get('/api/top-picks', async (req, res) => {
   }
 });
 
+// ── GET /api/statcast-check  ──────────────────────────────────────────────────
+// Verifies real Statcast data is flowing from Baseball Savant.
+// Open this URL in your browser to confirm data source.
+app.get('/api/statcast-check', async (_req, res) => {
+  try {
+    const { getStatcastDiagnostics } = require('./statcastService');
+    const diag = await getStatcastDiagnostics();
+    res.json(diag);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── GET /api/status  ──────────────────────────────────────────────────────────
 // Shows cache state and slate readiness.
 app.get('/api/status', (req, res) => {
