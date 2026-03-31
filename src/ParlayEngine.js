@@ -1,3 +1,4 @@
+// MLB Parlay Engine v2
 const { calculateHRScore, ratePitcherMatchup, getThreatRating } = require('./hrEngine');
 
 // ─────────────────────────────────────────────────────────────────────────────
