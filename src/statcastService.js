@@ -45,11 +45,11 @@ async function loadEVBarrelLeaderboard() {
         bbe:          parseInt(row.attempts || row.bbe || '0'),
         avgExitVelo:  parseFloat(row.avg_hit_speed    || '0'),
         maxExitVelo:  parseFloat(row.max_hit_speed    || '0'),
-        barrelRate:   parseFloat(row.brl_percent      || row.barrel_batted_rate || '0'),
-        hardHitRate:  parseFloat(row.hard_hit_percent || '0'),
-        sweetSpotRate:parseFloat(row.anglesweetspotpercent || row.sweet_spot_percent || '0'),
-        launchAngle:  parseFloat(row.avg_launch_angle || '0'),
-        flyBallRate:  parseFloat(row.flb_percent      || row.fb_percent || '0'),
+        barrelRate:   parseFloat(row.brl_percent      || row.barrel_batted_rate || row.barrels || '0'),
+        hardHitRate:  parseFloat(row.hard_hit_percent || row['hard hit%'] || row.hard_hit_rate || row.hh_percent || '0'),
+        sweetSpotRate:parseFloat(row.anglesweetspotpercent || row.sweet_spot_percent || row.la_sweet_spot_percent || '0'),
+        launchAngle:  parseFloat(row.avg_launch_angle || row.launch_angle_avg || '0'),
+        flyBallRate:  parseFloat(row.flb_percent      || row.fb_percent || row.fly_ball_percent || '0'),
       };
     });
 
@@ -224,11 +224,24 @@ async function getStatcastDiagnostics() {
     loadEVBarrelLeaderboard(),
     loadExpectedStatsLeaderboard(),
   ]);
+
+  // Also fetch raw headers for debugging
+  let evHeaders = [];
+  try {
+    const res = await axios.get(
+      `${SAVANT_BASE}/leaderboard/statcast?type=batter&year=${CURRENT_SEASON}&position=&team=&min=10&sort_col=barrels&sort_order=desc&csv=true`,
+      { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'text/csv,*/*' }, timeout: 15000, responseType: 'text' }
+    );
+    const firstLine = (res.data || '').split('\n')[0];
+    evHeaders = splitCSVLine(firstLine);
+  } catch (e) { evHeaders = ['fetch failed: ' + e.message]; }
+
   return {
     season:               CURRENT_SEASON,
     evBarrelPlayers:      Object.keys(evIndex).length,
     expectedStatsPlayers: Object.keys(xIndex).length,
     dataFlowing:          Object.keys(evIndex).length > 0,
+    evCSVHeaders:         evHeaders,
     evSample:             Object.values(evIndex).slice(0, 3),
     xSample:              Object.values(xIndex).slice(0, 3),
   };
