@@ -4,6 +4,7 @@ const NodeCache = require('node-cache');
 const mlb     = require('./mlbService');
 const { buildGame } = require('./gameBuilder');
 const { warmStatcastCache } = require('./statcastService');
+const { buildDailyPayload } = require('./parlayEngine');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -103,7 +104,90 @@ function leanPlayer(p, game, teamAbbr) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /api/game-picks  ← PRIMARY ENDPOINT FOR THE APP
+// GET /api/daily  ← THE ONLY ENDPOINT THE APP NEEDS
+// Returns everything pre-computed: top threats, smart parlays, daily AI pick.
+// App renders this directly — zero processing on the phone.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/daily', async (req, res) => {
+  try {
+    const date     = req.query.date || new Date().toISOString().split('T')[0];
+    const cacheKey = `daily_${date}`;
+    const cached   = slateCache.get(cacheKey);
+    if (cached) return res.json({ date, fromCache: true, ...cached });
+
+    // Build game picks first
+    const games = await getOrBuildSlate(date);
+    const gamePicks = buildLeanGamePicks(games, 2);
+
+    // Build all predictions server-side
+    const payload = buildDailyPayload(gamePicks);
+
+    // Add lean game schedule for display
+    payload.games = gamePicks.map(game => ({
+      id:          game.id,
+      status:      game.status,
+      gameTime:    game.gameTime,
+      dayNight:    game.dayNight,
+      lineupStatus:game.lineupStatus,
+      venue:       game.venue,
+      weather:     game.weather,
+      awayTeam: {
+        id:              game.awayTeam.id,
+        name:            game.awayTeam.name,
+        abbreviation:    game.awayTeam.abbreviation,
+        record:          game.awayTeam.record,
+        probablePitcher: game.awayTeam.probablePitcher
+          ? { id: game.awayTeam.probablePitcher.id, fullName: game.awayTeam.probablePitcher.fullName, throwsHand: game.awayTeam.probablePitcher.throwsHand, era: game.awayTeam.probablePitcher.era }
+          : null,
+        hasOfficialLineup: game.awayTeam.hasOfficialLineup,
+        lineup: (game.awayTeam.lineup || []).slice(0, 9).map(p => ({
+          playerId: p.playerId, name: p.name, position: p.position,
+          battingOrder: p.battingOrder, isOfficialStarter: p.isOfficialStarter,
+        })),
+        topPicks: game.topPicks.filter(p => p.teamAbbreviation === game.awayTeam.abbreviation),
+      },
+      homeTeam: {
+        id:              game.homeTeam.id,
+        name:            game.homeTeam.name,
+        abbreviation:    game.homeTeam.abbreviation,
+        record:          game.homeTeam.record,
+        probablePitcher: game.homeTeam.probablePitcher
+          ? { id: game.homeTeam.probablePitcher.id, fullName: game.homeTeam.probablePitcher.fullName, throwsHand: game.homeTeam.probablePitcher.throwsHand, era: game.homeTeam.probablePitcher.era }
+          : null,
+        hasOfficialLineup: game.homeTeam.hasOfficialLineup,
+        lineup: (game.homeTeam.lineup || []).slice(0, 9).map(p => ({
+          playerId: p.playerId, name: p.name, position: p.position,
+          battingOrder: p.battingOrder, isOfficialStarter: p.isOfficialStarter,
+        })),
+        topPicks: game.topPicks.filter(p => p.teamAbbreviation === game.homeTeam.abbreviation),
+      },
+    }));
+
+    payload.totalGames = gamePicks.length;
+    payload.totalPicks = payload.topThreats.length;
+
+    slateCache.set(cacheKey, payload);
+    console.log(`/api/daily ready: ${payload.totalGames} games, ${payload.totalPicks} threats, dailyPick=${!!payload.dailyPick}`);
+    res.json({ date, fromCache: false, ...payload });
+  } catch (err) {
+    console.error('/api/daily error:', err);
+    res.status(500).json({ error: 'Failed to build daily payload', detail: err.message });
+  }
+});
+
+function buildLeanGamePicks(games, topN) {
+  return games.map(game => {
+    const eligible = [
+      ...game.awayTeam.allPlayers.map(p => ({ p, abbr: game.awayTeam.abbreviation })),
+      ...game.homeTeam.allPlayers.map(p => ({ p, abbr: game.homeTeam.abbreviation })),
+    ].filter(({ p }) => p.isAvailable && !p.injuryStatus?.isInjured);
+    eligible.sort((a, b) => b.p.confidenceRating - a.p.confidenceRating);
+    const topPicks = eligible.slice(0, topN).map(({ p, abbr }) => leanPlayer(p, game, abbr));
+    return { ...game, topPicks };
+  });
+}
+
+
 // Returns top 2 HR threats per game — lean objects only.
 // Max payload: 15 games × 2 players = 30 lean objects. Never crashes the app.
 // ─────────────────────────────────────────────────────────────────────────────
