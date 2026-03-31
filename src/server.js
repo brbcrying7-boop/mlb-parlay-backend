@@ -8,240 +8,282 @@ const { warmStatcastCache } = require('./statcastService');
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-// Full slate cache — rebuilt every 10 min
 const slateCache = new NodeCache({ stdTTL: 600 });
 
-// ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
-// Request logger
 app.use((req, _res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
   next();
 });
 
-// ── Health check ─────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => {
-  res.json({
-    status:    'ok',
-    timestamp: new Date().toISOString(),
-    season:    mlb.CURRENT_SEASON,
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared: build and cache the full slate
+// ─────────────────────────────────────────────────────────────────────────────
+async function getOrBuildSlate(date) {
+  const cacheKey = `slate_${date}`;
+  const cached = slateCache.get(cacheKey);
+  if (cached) return cached;
+
+  console.log(`Building full slate for ${date}...`);
+  const rawGames = await mlb.getTodaysSchedule(date);
+
+  const bettable = new Set(['Scheduled', 'Pre-Game', 'Warmup', 'Delayed Start', 'Postponed']);
+  const toProcess = rawGames.filter(g => {
+    const s = g.status?.detailedState || '';
+    return bettable.has(s) || s.toLowerCase().includes('scheduled');
   });
+
+  console.log(`Processing ${toProcess.length} of ${rawGames.length} games`);
+
+  const builtGames = [];
+  for (const rawGame of toProcess) {
+    const game = await buildGame(rawGame);
+    if (game) builtGames.push(game);
+  }
+
+  slateCache.set(cacheKey, builtGames);
+  console.log(`Slate ready: ${builtGames.length} games`);
+  return builtGames;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: build a lean player object — only what the app needs
+// ─────────────────────────────────────────────────────────────────────────────
+function leanPlayer(p, game, teamAbbr) {
+  return {
+    playerId:          p.playerId,
+    name:              p.name,
+    position:          p.position,
+    battingOrder:      p.battingOrder || 0,
+    isOfficialStarter: p.isOfficialStarter || false,
+    isAvailable:       p.isAvailable !== false,
+    injuryStatus:      p.injuryStatus || { isInjured: false },
+    confidenceRating:  p.confidenceRating || 0,
+    seasonStats: {
+      homeRuns:   p.seasonStats?.homeRuns   || 0,
+      avg:        p.seasonStats?.avg        || '0.000',
+      obp:        p.seasonStats?.obp        || '0.000',
+      slg:        p.seasonStats?.slg        || '0.000',
+      ops:        p.seasonStats?.ops        || '0.000',
+      atBats:     p.seasonStats?.atBats     || 0,
+    },
+    advancedMetrics: {
+      barrelRate:     p.advancedMetrics?.barrelRate     || 0,
+      hardHitRate:    p.advancedMetrics?.hardHitRate    || 0,
+      avgExitVelocity:p.advancedMetrics?.avgExitVelocity|| 0,
+      xwOBA:          p.advancedMetrics?.xwOBA          || 0,
+      threatRating:   p.advancedMetrics?.threatRating   || 'MODERATE',
+      dataSource:     p.advancedMetrics?.dataSource     || 'derived',
+      iso:            p.advancedMetrics?.iso            || 0,
+    },
+    recentForm: {
+      trend:    p.recentForm?.trend    || 'stable',
+      homeRuns: p.recentForm?.homeRuns || 0,
+      last10HR: p.recentForm?.last10HR || 0,
+      avg:      p.recentForm?.avg      || '0.000',
+    },
+    vsOpposingPitcher: {
+      advantage:   p.vsOpposingPitcher?.advantage   || 'neutral',
+      confidence:  p.vsOpposingPitcher?.confidence  || 50,
+      pitcherHand: p.vsOpposingPitcher?.pitcherHand || 'R',
+      pitcherERA:  p.vsOpposingPitcher?.pitcherERA  || null,
+      pitcherHR9:  p.vsOpposingPitcher?.pitcherHR9  || null,
+    },
+    hrScoreComponents: p.hrScoreComponents || null,
+    // Game context
+    gameId:        game.id,
+    gameTime:      game.gameTime,
+    teamAbbreviation: teamAbbr,
+    venueName:     game.venue?.name    || '',
+    venueHRFactor: game.venue?.hrFactor || 1.0,
+    weather:       game.weather || null,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/game-picks  ← PRIMARY ENDPOINT FOR THE APP
+// Returns top 2 HR threats per game — lean objects only.
+// Max payload: 15 games × 2 players = 30 lean objects. Never crashes the app.
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/api/game-picks', async (req, res) => {
+  try {
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const topN = Math.min(parseInt(req.query.topN || '2'), 5); // max 5 per game
+
+    const cacheKey = `game_picks_${date}_${topN}`;
+    const cached = slateCache.get(cacheKey);
+    if (cached) return res.json({ date, fromCache: true, ...cached });
+
+    const games = await getOrBuildSlate(date);
+
+    const gamePicksResponse = [];
+    const allTopPlayers = [];
+
+    games.forEach(game => {
+      // Score all available players from both teams
+      const eligible = [
+        ...game.awayTeam.allPlayers.map(p => ({ p, abbr: game.awayTeam.abbreviation })),
+        ...game.homeTeam.allPlayers.map(p => ({ p, abbr: game.homeTeam.abbreviation })),
+      ].filter(({ p }) => p.isAvailable && !p.injuryStatus?.isInjured);
+
+      // Sort by HR score descending
+      eligible.sort((a, b) => b.p.confidenceRating - a.p.confidenceRating);
+
+      // Take top N per game
+      const topForGame = eligible.slice(0, topN).map(({ p, abbr }) => leanPlayer(p, game, abbr));
+
+      // Build lean game object — NO allPlayers arrays
+      gamePicksResponse.push({
+        id:          game.id,
+        status:      game.status,
+        gameTime:    game.gameTime,
+        dayNight:    game.dayNight,
+        lineupStatus:game.lineupStatus,
+        venue: {
+          id:       game.venue?.id,
+          name:     game.venue?.name,
+          hrFactor: game.venue?.hrFactor,
+          altitude: game.venue?.altitude,
+        },
+        weather: game.weather,
+        awayTeam: {
+          id:               game.awayTeam.id,
+          name:             game.awayTeam.name,
+          abbreviation:     game.awayTeam.abbreviation,
+          record:           game.awayTeam.record,
+          probablePitcher:  game.awayTeam.probablePitcher
+            ? {
+                id:          game.awayTeam.probablePitcher.id,
+                fullName:    game.awayTeam.probablePitcher.fullName,
+                throwsHand:  game.awayTeam.probablePitcher.throwsHand,
+                era:         game.awayTeam.probablePitcher.era,
+                hr9:         game.awayTeam.probablePitcher.hr9,
+              }
+            : null,
+          hasOfficialLineup: game.awayTeam.hasOfficialLineup,
+          lineup: (game.awayTeam.lineup || []).map(p => ({
+            playerId: p.playerId, name: p.name,
+            position: p.position, battingOrder: p.battingOrder,
+            isOfficialStarter: p.isOfficialStarter,
+          })),
+        },
+        homeTeam: {
+          id:               game.homeTeam.id,
+          name:             game.homeTeam.name,
+          abbreviation:     game.homeTeam.abbreviation,
+          record:           game.homeTeam.record,
+          probablePitcher:  game.homeTeam.probablePitcher
+            ? {
+                id:          game.homeTeam.probablePitcher.id,
+                fullName:    game.homeTeam.probablePitcher.fullName,
+                throwsHand:  game.homeTeam.probablePitcher.throwsHand,
+                era:         game.homeTeam.probablePitcher.era,
+                hr9:         game.homeTeam.probablePitcher.hr9,
+              }
+            : null,
+          hasOfficialLineup: game.homeTeam.hasOfficialLineup,
+          lineup: (game.homeTeam.lineup || []).map(p => ({
+            playerId: p.playerId, name: p.name,
+            position: p.position, battingOrder: p.battingOrder,
+            isOfficialStarter: p.isOfficialStarter,
+          })),
+        },
+        topPicks: topForGame,
+      });
+
+      allTopPlayers.push(...topForGame);
+    });
+
+    // Sort all top players across the full slate by HR score
+    allTopPlayers.sort((a, b) => b.confidenceRating - a.confidenceRating);
+
+    const payload = {
+      totalGames:   gamePicksResponse.length,
+      totalPicks:   allTopPlayers.length,
+      games:        gamePicksResponse,
+      allTopPlayers,
+    };
+
+    slateCache.set(cacheKey, payload);
+    console.log(`game-picks: ${gamePicksResponse.length} games, ${allTopPlayers.length} top players`);
+    res.json({ date, fromCache: false, ...payload });
+  } catch (err) {
+    console.error('game-picks error:', err);
+    res.status(500).json({ error: 'Failed to build game picks', detail: err.message });
+  }
 });
 
-// ── GET /api/slate  ───────────────────────────────────────────────────────────
-// Returns the full day's slate with every player scored.
-// Query param: ?date=YYYY-MM-DD  (defaults to today)
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /health
+// ─────────────────────────────────────────────────────────────────────────────
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString(), season: mlb.CURRENT_SEASON });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/slate  (kept for debugging — not used by app)
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/slate', async (req, res) => {
   try {
     const date = req.query.date || new Date().toISOString().split('T')[0];
-    const cacheKey = `slate_${date}`;
-    const cached = slateCache.get(cacheKey);
-    if (cached) {
-      return res.json({ date, games: cached, fromCache: true });
-    }
-
-    console.log(`Building full slate for ${date}...`);
-    const rawGames = await mlb.getTodaysSchedule(date);
-
-    // Bettable statuses — all pre-game variants
-    const bettable = new Set([
-      'Scheduled', 'Pre-Game', 'Warmup', 'Delayed Start', 'Postponed',
-    ]);
-    const toProcess = rawGames.filter(g => {
-      const s = g.status?.detailedState || '';
-      return bettable.has(s) || s.toLowerCase().includes('scheduled');
-    });
-
-    console.log(`Processing ${toProcess.length} of ${rawGames.length} games`);
-
-    // Build games sequentially to respect MLB API rate limits
-    const builtGames = [];
-    for (const rawGame of toProcess) {
-      const game = await buildGame(rawGame);
-      if (game) builtGames.push(game);
-    }
-
-    slateCache.set(cacheKey, builtGames);
-    console.log(`Slate ready: ${builtGames.length} games, ${
-      builtGames.reduce((s, g) => s + g.awayTeam.allPlayers.length + g.homeTeam.allPlayers.length, 0)
-    } players`);
-
-    res.json({ date, games: builtGames, fromCache: false });
+    const games = await getOrBuildSlate(date);
+    res.json({ date, gameCount: games.length, fromCache: true });
   } catch (err) {
-    console.error('Slate error:', err);
-    res.status(500).json({ error: 'Failed to build slate', detail: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/players  ─────────────────────────────────────────────────────────
-// Returns all scored players from today's slate in a flat list, sorted by HR score.
-app.get('/api/players', async (req, res) => {
-  try {
-    const date = req.query.date || new Date().toISOString().split('T')[0];
-    const cacheKey = `slate_${date}`;
-    const cached = slateCache.get(cacheKey);
-
-    let games = cached;
-    if (!games) {
-      // Trigger full slate build
-      const slateRes = await fetch(`http://localhost:${PORT}/api/slate?date=${date}`).then(r => r.json()).catch(() => null);
-      games = slateRes?.games || [];
-    }
-
-    const players = [];
-    games.forEach(game => {
-      [...game.awayTeam.allPlayers, ...game.homeTeam.allPlayers].forEach(p => {
-        players.push({
-          ...p,
-          gameId:           game.id,
-          gameTime:         game.gameTime,
-          venueName:        game.venue.name,
-          venueHRFactor:    game.venue.hrFactor,
-          weather:          game.weather,
-          teamAbbreviation: game.awayTeam.allPlayers.find(ap => ap.playerId === p.playerId)
-            ? game.awayTeam.abbreviation
-            : game.homeTeam.abbreviation,
-        });
-      });
-    });
-
-    players.sort((a, b) => b.confidenceRating - a.confidenceRating);
-    res.json({ date, count: players.length, players });
-  } catch (err) {
-    console.error('Players error:', err);
-    res.status(500).json({ error: 'Failed to fetch players', detail: err.message });
-  }
-});
-
-// ── GET /api/player/:id  ──────────────────────────────────────────────────────
-// Deep profile for a single player including HR score breakdown.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/player/:id
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/player/:id', async (req, res) => {
   try {
     const playerId = parseInt(req.params.id);
     const date = req.query.date || new Date().toISOString().split('T')[0];
-    const cacheKey = `slate_${date}`;
-    const games = slateCache.get(cacheKey) || [];
+    const games = slateCache.get(`slate_${date}`) || [];
 
     for (const game of games) {
       const found =
-        game.awayTeam.allPlayers.find(p => p.playerId === playerId) ||
-        game.homeTeam.allPlayers.find(p => p.playerId === playerId);
-
+        game.awayTeam.allPlayers?.find(p => p.playerId === playerId) ||
+        game.homeTeam.allPlayers?.find(p => p.playerId === playerId);
       if (found) {
-        return res.json({
-          player:  found,
-          game: {
-            id:         game.id,
-            gameTime:   game.gameTime,
-            venue:      game.venue,
-            weather:    game.weather,
-            awayTeam:   { id: game.awayTeam.id, name: game.awayTeam.name, abbreviation: game.awayTeam.abbreviation },
-            homeTeam:   { id: game.homeTeam.id, name: game.homeTeam.name, abbreviation: game.homeTeam.abbreviation },
-            lineupStatus: game.lineupStatus,
-          },
-        });
+        const abbr = game.awayTeam.allPlayers?.find(p => p.playerId === playerId)
+          ? game.awayTeam.abbreviation : game.homeTeam.abbreviation;
+        return res.json({ player: leanPlayer(found, game, abbr), gameId: game.id });
       }
     }
-
-    res.status(404).json({ error: 'Player not found in today\'s slate' });
-  } catch (err) {
-    console.error('Player detail error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── GET /api/pitcher/:id  ─────────────────────────────────────────────────────
-// Pitcher stats endpoint for direct lookups.
-app.get('/api/pitcher/:id', async (req, res) => {
-  try {
-    const stats = await mlb.getPitcherStats(parseInt(req.params.id));
-    if (!stats) return res.status(404).json({ error: 'Pitcher not found' });
-    res.json(stats);
+    res.status(404).json({ error: 'Player not found' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/top-picks  ───────────────────────────────────────────────────────
-// Returns today's top HR threats, optionally filtered by minimum score.
-app.get('/api/top-picks', async (req, res) => {
-  try {
-    const date     = req.query.date  || new Date().toISOString().split('T')[0];
-    const minScore = parseInt(req.query.minScore || '50');
-    const limit    = parseInt(req.query.limit    || '20');
-    const cacheKey = `slate_${date}`;
-    const games    = slateCache.get(cacheKey) || [];
-
-    const picks = [];
-    games.forEach(game => {
-      [...game.awayTeam.allPlayers, ...game.homeTeam.allPlayers]
-        .filter(p => p.isAvailable && !p.injuryStatus?.isInjured && p.confidenceRating >= minScore)
-        .forEach(p => {
-          picks.push({
-            playerId:        p.playerId,
-            name:            p.name,
-            position:        p.position,
-            hrScore:         p.confidenceRating,
-            threatRating:    p.advancedMetrics?.threatRating,
-            dataSource:      p.advancedMetrics?.dataSource,
-            battingOrder:    p.battingOrder,
-            isOfficialStarter: p.isOfficialStarter,
-            barrelRate:      p.advancedMetrics?.barrelRate,
-            hardHitRate:     p.advancedMetrics?.hardHitRate,
-            avgExitVelocity: p.advancedMetrics?.avgExitVelocity,
-            teamAbbr:        game.awayTeam.allPlayers.find(ap => ap.playerId === p.playerId)
-              ? game.awayTeam.abbreviation
-              : game.homeTeam.abbreviation,
-            venueName:       game.venue.name,
-            hrFactor:        game.venue.hrFactor,
-            gameTime:        game.gameTime,
-            recentFormTrend: p.recentForm?.trend,
-            last10HR:        p.recentForm?.last10HR,
-            seasonHR:        p.seasonStats?.homeRuns,
-          });
-        });
-    });
-
-    picks.sort((a, b) => b.hrScore - a.hrScore);
-    res.json({ date, count: picks.length, picks: picks.slice(0, limit) });
-  } catch (err) {
-    console.error('Top picks error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── GET /api/statcast-check  ──────────────────────────────────────────────────
-// Verifies real Statcast data is flowing from Baseball Savant.
-// Open this URL in your browser to confirm data source.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/statcast-check
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/statcast-check', async (_req, res) => {
   try {
     const { getStatcastDiagnostics } = require('./statcastService');
-    const diag = await getStatcastDiagnostics();
-    res.json(diag);
+    res.json(await getStatcastDiagnostics());
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── GET /api/status  ──────────────────────────────────────────────────────────
-// Shows cache state and slate readiness.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/status
+// ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/status', (req, res) => {
-  const date     = new Date().toISOString().split('T')[0];
-  const slate    = slateCache.get(`slate_${date}`);
-  const gameCount    = slate?.length || 0;
-  const playerCount  = slate?.reduce(
-    (s, g) => s + g.awayTeam.allPlayers.length + g.homeTeam.allPlayers.length, 0
-  ) || 0;
-
+  const date  = new Date().toISOString().split('T')[0];
+  const slate = slateCache.get(`slate_${date}`);
   res.json({
-    slateReady:    gameCount > 0,
-    gamesLoaded:   gameCount,
-    playersScored: playerCount,
+    slateReady:  !!slate,
+    gamesLoaded: slate?.length || 0,
     date,
-    season:        mlb.CURRENT_SEASON,
-    cacheKeys:     slateCache.keys(),
+    season: mlb.CURRENT_SEASON,
+    cacheKeys: slateCache.keys(),
   });
 });
 
@@ -251,7 +293,6 @@ app.get('/api/status', (req, res) => {
 app.listen(PORT, () => {
   console.log(`MLB Parlay Backend running on port ${PORT}`);
   console.log(`Season: ${mlb.CURRENT_SEASON}`);
-  // Warm Statcast cache in background so first request is fast
   warmStatcastCache();
 });
 
