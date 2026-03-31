@@ -7,6 +7,7 @@ const CURRENT_SEASON = 2026;
 
 let evBarrelIndex      = null;
 let expectedStatsIndex = null;
+let hardHitIndex       = null;
 
 async function loadEVBarrelLeaderboard() {
   if (evBarrelIndex) return evBarrelIndex;
@@ -45,11 +46,16 @@ async function loadEVBarrelLeaderboard() {
         bbe:          parseInt(row.attempts || row.bbe || '0'),
         avgExitVelo:  parseFloat(row.avg_hit_speed    || '0'),
         maxExitVelo:  parseFloat(row.max_hit_speed    || '0'),
-        barrelRate:   parseFloat(row.brl_percent      || row.barrel_batted_rate || row.barrels || '0'),
-        hardHitRate:  parseFloat(row.hard_hit_percent || row['hard hit%'] || row.hard_hit_rate || row.hh_percent || '0'),
-        sweetSpotRate:parseFloat(row.anglesweetspotpercent || row.sweet_spot_percent || row.la_sweet_spot_percent || '0'),
-        launchAngle:  parseFloat(row.avg_launch_angle || row.launch_angle_avg || '0'),
-        flyBallRate:  parseFloat(row.flb_percent      || row.fb_percent || row.fly_ball_percent || '0'),
+        barrelRate:   parseFloat(row.brl_percent      || row.barrel_batted_rate || '0'),
+        // ev95percent = % of batted balls 95mph+ — best proxy for hard hit rate in this endpoint
+        hardHitRate:  parseFloat(row.ev95percent      || row.hard_hit_percent  || '0'),
+        sweetSpotRate:parseFloat(row.anglesweetspotpercent || row.sweet_spot_percent || '0'),
+        // avg_hit_angle is the confirmed column name from live CSV headers
+        launchAngle:  parseFloat(row.avg_hit_angle    || row.avg_launch_angle  || '0'),
+        // fbld = fly ball distance column, fb_percent not in this endpoint
+        flyBallRate:  parseFloat(row.fbld             || row.flb_percent       || '0'),
+        ev95plus:     parseFloat(row.ev95plus         || '0'),
+        ev95percent:  parseFloat(row.ev95percent      || '0'),
       };
     });
 
@@ -115,6 +121,56 @@ async function loadExpectedStatsLeaderboard() {
   }
 }
 
+async function loadHardHitLeaderboard() {
+  if (hardHitIndex) return hardHitIndex;
+  const cacheKey = `savant_hardhit_${CURRENT_SEASON}`;
+  const cached = statcastCache.get(cacheKey);
+  if (cached) { hardHitIndex = cached; return hardHitIndex; }
+
+  try {
+    console.log('[Savant] Fetching Hard Hit leaderboard...');
+    // Savant custom leaderboard with hard_hit_percent selection
+    const res = await axios.get(
+      `${SAVANT_BASE}/leaderboard/custom` +
+      `?year=${CURRENT_SEASON}&type=batter&filter=&selections=hard_hit_percent&chart=false&x=hard_hit_percent&y=hard_hit_percent&r=no&chartType=beeswarm&sort=hard_hit_percent&sortDir=desc&min=q&csv=true`,
+      {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (compatible; MLBParlayBackend/2.0)',
+          'Accept': 'text/csv,*/*',
+          'Referer': 'https://baseballsavant.mlb.com/leaderboard/custom',
+        },
+        timeout: 25000,
+        responseType: 'text',
+      }
+    );
+
+    const text = res.data || '';
+    if (text.trim().startsWith('<') || text.length < 100) {
+      console.error('[Savant] Hard Hit response is not CSV. Length:', text.length);
+      hardHitIndex = {};
+      return hardHitIndex;
+    }
+
+    const index = parseCSV(text, row => {
+      const pid = row.player_id || row.batter_id;
+      if (!pid) return null;
+      return {
+        pid,
+        hardHitRate: parseFloat(row.hard_hit_percent || row['hard_hit%'] || '0'),
+      };
+    });
+
+    console.log(`[Savant] Hard Hit loaded: ${Object.keys(index).length} players`);
+    hardHitIndex = index;
+    statcastCache.set(cacheKey, index);
+    return hardHitIndex;
+  } catch (err) {
+    console.error('[Savant] Hard Hit fetch failed:', err.message);
+    hardHitIndex = {};
+    return hardHitIndex;
+  }
+}
+
 function splitCSVLine(line) {
   const result = [];
   let current  = '';
@@ -151,26 +207,36 @@ async function getStatcastForPlayer(playerId, seasonStats) {
   const cached = statcastCache.get(key);
   if (cached) return cached;
 
-  const [evIndex, xIndex] = await Promise.all([
+  const [evIndex, xIndex, hhIndex] = await Promise.all([
     loadEVBarrelLeaderboard(),
     loadExpectedStatsLeaderboard(),
+    loadHardHitLeaderboard(),
   ]);
 
   const pid    = String(playerId);
   const evData = evIndex[pid];
   const xData  = xIndex[pid];
+  const hhData = hhIndex[pid];
 
   if (evData && evData.avgExitVelo > 0 && evData.bbe >= 5) {
+    // Use real hard hit rate from dedicated endpoint, fall back to ev95percent proxy
+    const hardHitRate = hhData?.hardHitRate > 0
+      ? hhData.hardHitRate
+      : evData.ev95percent > 0
+        ? evData.ev95percent
+        : evData.hardHitRate;
+
     const result = {
       source:       'statcast',
       pa:           evData.pa,
       barrelRate:   evData.barrelRate,
-      hardHitRate:  evData.hardHitRate,
+      hardHitRate:  hardHitRate,
       avgExitVelo:  evData.avgExitVelo,
       maxExitVelo:  evData.maxExitVelo,
       sweetSpotRate:evData.sweetSpotRate,
       launchAngle:  evData.launchAngle,
       flyBallRate:  evData.flyBallRate,
+      ev95percent:  evData.ev95percent,
       xSLG:  xData?.xSLG  || parseFloat((parseFloat(seasonStats?.slg || '0.400') * 1.02).toFixed(3)),
       xwOBA: xData?.xwOBA || parseFloat((0.220 + parseFloat(seasonStats?.obp || '0.320') * 0.55).toFixed(3)),
       xBA:   xData?.xBA   || parseFloat(seasonStats?.avg || '0.250'),
@@ -220,12 +286,12 @@ function deriveStatcastFromSeasonStats(s) {
 }
 
 async function getStatcastDiagnostics() {
-  const [evIndex, xIndex] = await Promise.all([
+  const [evIndex, xIndex, hhIndex] = await Promise.all([
     loadEVBarrelLeaderboard(),
     loadExpectedStatsLeaderboard(),
+    loadHardHitLeaderboard(),
   ]);
 
-  // Also fetch raw headers for debugging
   let evHeaders = [];
   try {
     const res = await axios.get(
@@ -240,10 +306,12 @@ async function getStatcastDiagnostics() {
     season:               CURRENT_SEASON,
     evBarrelPlayers:      Object.keys(evIndex).length,
     expectedStatsPlayers: Object.keys(xIndex).length,
+    hardHitPlayers:       Object.keys(hhIndex).length,
     dataFlowing:          Object.keys(evIndex).length > 0,
     evCSVHeaders:         evHeaders,
     evSample:             Object.values(evIndex).slice(0, 3),
     xSample:              Object.values(xIndex).slice(0, 3),
+    hhSample:             Object.values(hhIndex).slice(0, 3),
   };
 }
 
@@ -251,6 +319,7 @@ function warmStatcastCache() {
   Promise.all([
     loadEVBarrelLeaderboard(),
     loadExpectedStatsLeaderboard(),
+    loadHardHitLeaderboard(),
   ]).catch(err => console.error('[Savant] Warm failed:', err.message));
 }
 
